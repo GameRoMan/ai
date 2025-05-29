@@ -2,6 +2,7 @@ import { TextEncoder } from "node:util";
 import { streamText } from "ai";
 import { http, type DefaultBodyType } from "msw";
 import { setupServer } from "msw/node";
+import z from "zod";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { createWorkersAI } from "../src/index";
 
@@ -110,9 +111,10 @@ describe("REST API - Streaming Text Tests", () => {
 					capturedOptions = Object.fromEntries(url.searchParams.entries());
 
 					return new Response(
-						[`data: {"response":"Hello with options"}\n\n`, "data: [DONE]\n\n"].join(
-							"",
-						),
+						[
+							`data: {"response":"Hello with options"}\n\n`,
+							"data: [DONE]\n\n",
+						].join(""),
 						{
 							status: 200,
 							headers: {
@@ -150,6 +152,164 @@ describe("REST API - Streaming Text Tests", () => {
 		expect(capturedOptions).toHaveProperty("aString", "a");
 		expect(capturedOptions).toHaveProperty("aBool", "true");
 		expect(capturedOptions).toHaveProperty("aNumber", "1");
+	});
+
+	it("should handle tool call inside response", async () => {
+		server.use(
+			http.post(
+				`https://api.cloudflare.com/client/v4/accounts/${TEST_ACCOUNT_ID}/ai/run/${TEST_MODEL}`,
+				async () => {
+					return new Response(
+						[
+							`data: {"response":"{\\""}\n\n`,
+							`data: {"response":"type"}\n\n`,
+							`data: {"response":"\\":"}\n\n`,
+							`data: {"response":" \\""}\n\n`,
+							`data: {"response":"function"}\n\n`,
+							`data: {"response":"\\","}\n\n`,
+							`data: {"response":" \\""}\n\n`,
+							`data: {"response":"name"}\n\n`,
+							`data: {"response":"\\":"}\n\n`,
+							`data: {"response":" \\""}\n\n`,
+							`data: {"response":"get"}\n\n`,
+							`data: {"response":"_weather"}\n\n`,
+							`data: {"response":"\\","}\n\n`,
+							`data: {"response":" \\""}\n\n`,
+							`data: {"response":"parameters"}\n\n`,
+							`data: {"response":"\\":"}\n\n`,
+							`data: {"response":" {\\""}\n\n`,
+							`data: {"response":"location"}\n\n`,
+							`data: {"response":"\\":"}\n\n`,
+							`data: {"response":" \\""}\n\n`,
+							`data: {"response":"London"}\n\n`,
+							`data: {"response":"\\"}}"}\n\n`,
+							`data: {"response":""}\n\n`,
+							`[DONE]\n\n`,
+						].join(""),
+						{
+							status: 200,
+							headers: {
+								"Content-Type": "text/event-stream",
+								"Transfer-Encoding": "chunked",
+							},
+						},
+					);
+				},
+			),
+		);
+
+		const workersai = createWorkersAI({
+			apiKey: TEST_API_KEY,
+			accountId: TEST_ACCOUNT_ID,
+		});
+
+		const result = await streamText({
+			model: workersai(TEST_MODEL),
+			prompt: "Get the weather information for London",
+			tools: {
+				get_weather: {
+					description: "Get the weather in a location",
+					parameters: z.object({
+						location: z
+							.string()
+							.describe("The location to get the weather for"),
+					}),
+					execute: async ({ location }) => {
+						// The `actual` execution of the tool call if the model decides to call it
+						return {
+							location,
+							weather: location === "London" ? "Raining" : "Sunny",
+						};
+					},
+				},
+			},
+		});
+
+		const toolCalls = [];
+		let finalText = "";
+
+		for await (const chunk of result.fullStream) {
+			console.log(chunk);
+
+			if (chunk.type === "tool-call") {
+				//@ts-expect-error: Types not during testingq
+				toolCalls.push(chunk?.toolCall);
+			} else if (chunk.type === "text-delta") {
+				finalText += chunk.textDelta;
+			}
+		}
+
+		expect(toolCalls).toHaveLength(0);
+		expect(finalText).toBe("");
+	});
+
+	it.only("should handle partial tool call inside tool_calls", async () => {
+		server.use(
+			http.post(
+				`https://api.cloudflare.com/client/v4/accounts/${TEST_ACCOUNT_ID}/ai/run/${TEST_MODEL}`,
+				async () => {
+					return new Response(
+						[
+							`data: {"response":"","tool_calls":[]}\n\n`,
+							`data: {"tool_calls":[{"id":"chatcmpl-tool-48e296b79c5b41c3b442cb7e692d7103","type":"function","index":0,"function":{"name":"get_weather"}}]}\n\n`,
+							`data: {"tool_calls":[{"index":0,"function":{"arguments":"{\\"location\\": \\""}}]}\n\n`,
+							`data: {"tool_calls":[{"index":0,"function":{"arguments":"London\\"}"}}]}\n\n`,
+							`data: {"tool_calls":[{"index":0,"function":{"arguments":""}}]}\n\n`,
+							`data: {"tool_calls":[]}\n\n`,
+							`[DONE]\n\n`,
+						].join(""),
+						{
+							status: 200,
+							headers: {
+								"Content-Type": "text/event-stream",
+								"Transfer-Encoding": "chunked",
+							},
+						},
+					);
+				},
+			),
+		);
+
+		const workersai = createWorkersAI({
+			apiKey: TEST_API_KEY,
+			accountId: TEST_ACCOUNT_ID,
+		});
+
+		const result = await streamText({
+			model: workersai(TEST_MODEL),
+			prompt: "Get the weather information for London",
+			tools: {
+				get_weather: {
+					description: "Get the weather in a location",
+					parameters: z.object({
+						location: z
+							.string()
+							.describe("The location to get the weather for"),
+					}),
+					execute: async ({ location }) => ({
+						location,
+						weather: location === "London" ? "Raining" : "Sunny",
+					}),
+				},
+			},
+		});
+
+		const toolCalls = [];
+		let finalText = "";
+
+		for await (const chunk of result.fullStream) {
+			console.log(chunk);
+
+			if (chunk.type === "tool_call") {
+				//@ts-expect-error: Types not during testingq
+				toolCalls.push(chunk?.toolCall);
+			} else if (chunk.type === "text-delta") {
+				finalText += chunk.textDelta;
+			}
+		}
+
+		expect(toolCalls).toHaveLength(0);
+		expect(finalText).toBe("");
 	});
 });
 
